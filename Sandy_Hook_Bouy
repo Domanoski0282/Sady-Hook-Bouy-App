@@ -1,0 +1,461 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Sandy Hook, NJ (NDBC 44065) – Live Ocean Conditions Monitor
+Author: <you>
+Role: Marine data scientist / Python developer
+Desc:
+  - Fetches standard met + wave data from NDBC realtime feed for station 44065
+  - Fetches water level (tide) from NOAA CO-OPS station 8531680 (Sandy Hook)
+  - Every 10 minutes: parses, computes metrics, detects anomalies, saves report,
+    CSV logs, and a 6-hr wave-height plot (wave_trend.png)
+Notes:
+  - Significant wave height WVHT (m), Dominant wave period DPD (s),
+    Mean wave direction MWD (deg true), Wind speed WSPD (m/s), Gust GST (m/s),
+    Pressure PRES (hPa). Tide (water level) in meters (CO-OPS units=metric).
+  - Time handling is UTC.
+"""
+
+import io
+import os
+import time
+import math
+import json
+import traceback
+from datetime import datetime, timedelta, timezone
+
+import requests
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# -------------------- Config --------------------
+STATION_NDBC = "44065"        # Sandy Hook / NY Harbor Entrance buoy
+STATION_COOPS = "8531680"     # Sandy Hook, NJ tide station (CO-OPS)
+OUT_DIR = "./sandy_hook_output"
+POLL_SECONDS = 600            # 10 minutes
+TIMEZONE = timezone.utc       # Work in UTC
+
+NDBC_URL_TXT = f"https://www.ndbc.noaa.gov/data/realtime2/{STATION_NDBC}.txt"
+COOPS_BASE_URL = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+
+# -------------------- Helpers --------------------
+def parse_ndbc_standard_met(text: str) -> pd.DataFrame:
+    """
+    Parse NDBC 'realtime2/<station>.txt' standard met file.
+    - Handles duplicated header names by suffixing _2, _3, etc.
+    - Case-insensitive detection of timestamp columns.
+    - Normalize common measurement column names to canonical uppercase keys:
+      WVHT, DPD, MWD, WSPD, GST, PRES, etc.
+    """
+    lines = text.strip().splitlines()
+    header_line_idx = None
+    for i, line in enumerate(lines):
+        if line.startswith("#YY") or line.startswith("#yr"):
+            header_line_idx = i
+
+    if header_line_idx is None:
+        raise ValueError("Could not find NDBC column header line.")
+
+    raw_cols = lines[header_line_idx].lstrip("#").split()
+    seen = {}
+    colnames = []
+    for c in raw_cols:
+        if c in seen:
+            seen[c] += 1
+            colnames.append(f"{c}_{seen[c]}")
+        else:
+            seen[c] = 1
+            colnames.append(c)
+
+    data_lines = [ln for ln in lines[header_line_idx + 1:] if ln.strip() and not ln.startswith("#")]
+    df = pd.read_csv(io.StringIO("\n".join(data_lines)), sep=r"\s+", names=colnames, dtype=str, engine="python")
+
+    # Helper: pick columns case-insensitively
+    def pick_ci(dfcols, *opts):
+        cols_l = {c.lower(): c for c in dfcols}
+        for o in opts:
+            key = o.lower()
+            if key in cols_l:
+                return cols_l[key]
+        return None
+
+    # detect timestamp cols (common variants)
+    yy_col = pick_ci(df.columns, "YY", "yr", "yyyy")
+    mm_col = pick_ci(df.columns, "MM", "mo", "month")
+    dd_col = pick_ci(df.columns, "DD", "dy", "day")
+    hh_col = pick_ci(df.columns, "hh", "hr", "hour")
+    mn_col = pick_ci(df.columns, "mm", "mn", "min", "minute")
+
+    if None in (yy_col, mm_col, dd_col, hh_col, mn_col):
+        raise ValueError(f"Timestamp columns not found. Available columns: {list(df.columns)[:20]}")
+
+    # Convert timestamp to timezone-aware UTC datetimes
+    yr_vals = df[yy_col].astype(int)
+    yr_vals = np.where(yr_vals < 100, yr_vals + 2000, yr_vals)
+    ts = pd.to_datetime(
+        dict(
+            year=yr_vals,
+            month=df[mm_col].astype(int),
+            day=df[dd_col].astype(int),
+            hour=df[hh_col].astype(int),
+            minute=df[mn_col].astype(int)
+        ),
+        utc=True
+    )
+    df.insert(0, "time", ts)
+
+    # Coerce numeric fields
+    for c in list(df.columns):
+        if c == "time":
+            continue
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.set_index("time").sort_index()
+
+    # Normalize canonical measurement column names:
+    # Map any column that matches (case-insensitive) a canonical prefix to that canonical name.
+    canonical = ["WVHT", "DPD", "MWD", "WSPD", "GST", "PRES", "WVHT_2", "DPD_2"]
+    # We'll create a mapping from canonical -> first matching column
+    norm_map = {}
+    cols_lower_to_orig = {c.lower(): c for c in df.columns}
+    for can in ["WVHT", "DPD", "MWD", "WSPD", "GST", "PRES"]:
+        found = None
+        for c in df.columns:
+            if c.lower() == can.lower() or c.lower().startswith(can.lower() + "_") or c.lower().startswith(can.lower()):
+                found = c
+                break
+        if found:
+            norm_map[found] = can
+
+    # Apply renaming (but avoid overwriting existing canonical if already present)
+    rename_map = {}
+    for orig_col, canon_col in norm_map.items():
+        if canon_col in df.columns:
+            # canonical already present (probably same column) — skip if it's the same
+            if orig_col == canon_col:
+                continue
+            # else keep the first canonical and do not overwrite
+            # but if canonical exists but is NaN and orig has data, prefer filling - handle later
+            continue
+        rename_map[orig_col] = canon_col
+
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    # If canonical exists but is completely NaN and a variant exists, fill it
+    for can in ["WVHT", "DPD", "MWD", "WSPD", "GST", "PRES"]:
+        if can in df.columns and df[can].notna().sum() == 0:
+            # find any column with same prefix (e.g., WVHT_2)
+            for c in df.columns:
+                if c.lower().startswith(can.lower() + "_") or (c.lower() != can.lower() and c.lower().startswith(can.lower())):
+                    if df[c].notna().any():
+                        df[can] = df[c]
+                        break
+
+    return df
+
+COOPS_URL = (
+    "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
+    "?product=water_level"
+    f"&station={STATION_COOPS}"
+    "&range=360"
+    "&units=metric"
+    "&time_zone=gmt"
+    "&format=json"
+)
+
+
+def fetch_ndbc_df() -> pd.DataFrame:
+    """
+    Fetch NDBC realtime2 standard met text and parse to DataFrame.
+    """
+    r = requests.get(NDBC_URL_TXT, timeout=20)
+    r.raise_for_status()
+    return parse_ndbc_standard_met(r.text)
+
+
+def fetch_coops_tide_df() -> pd.DataFrame:
+    """
+    Fetch last 6 hours water level (meters) for Sandy Hook 8531680 using range=6 (hours).
+    Uses the CO-OPS datagetter endpoint with params.
+    """
+    params = {
+        "product": "water_level",
+        "station": STATION_COOPS,
+        "range": 6,             # hours (6 hours) - API expects hours, not minutes
+        "units": "metric",
+        "time_zone": "gmt",
+        "datum": "MLLW",        # Mean Lower Low Water - required for water_level product
+        "format": "json"
+    }
+
+    r = requests.get(COOPS_BASE_URL, params=params, timeout=20)
+    
+    # Better error handling - show API error message
+    if r.status_code != 200:
+        try:
+            error_data = r.json()
+            error_msg = error_data.get("error", {}).get("message", r.text[:500])
+            raise ValueError(f"CO-OPS API error ({r.status_code}): {error_msg}")
+        except:
+            r.raise_for_status()
+    
+    data = r.json()
+
+    # CO-OPS returns {"data": [...]} or an error object
+    if "data" not in data:
+        # include body for debugging
+        raise ValueError(f"Bad CO-OPS response (no 'data'): {json.dumps(data)[:500]}")
+
+    recs = data["data"]
+    if not isinstance(recs, list) or len(recs) == 0:
+        # Return an empty tide df with correct columns
+        return pd.DataFrame(columns=["tide_m"]).set_index(pd.DatetimeIndex([]))
+
+    df = pd.DataFrame(recs)
+    # Expect fields 't' (time) and 'v' (value)
+    if "v" not in df.columns or "t" not in df.columns:
+        return pd.DataFrame(columns=["tide_m"]).set_index(pd.DatetimeIndex([]))
+
+    df["v"] = pd.to_numeric(df["v"], errors="coerce")
+    df["time"] = pd.to_datetime(df["t"], utc=True)
+    df = df[["time", "v"]].rename(columns={"v": "tide_m"}).set_index("time").sort_index()
+    return df
+    
+def pct_change_over_window(s: pd.Series) -> float:
+    s = s.dropna()
+    if s.empty:
+        return np.nan
+    mn, mx = float(s.min()), float(s.max())
+    if mn == mx == 0:
+        return 0.0
+    denom = (abs(mx) + abs(mn)) / 2.0 if (abs(mx) + abs(mn)) > 0 else 1.0
+    return (mx - mn) / denom * 100.0
+
+
+def dominant_mode(series_deg: pd.Series) -> float | None:
+    series_deg = series_deg.dropna()
+    if len(series_deg) == 0:
+        return np.nan
+    ang = np.deg2rad(series_deg.values)
+    x = np.cos(ang).mean()
+    y = np.sin(ang).mean()
+    return (np.degrees(np.arctan2(y, x)) % 360.0)
+
+
+def build_interpretation(metrics: dict) -> str:
+    notes = []
+    if not math.isnan(metrics.get("wvht_avg_1h", np.nan)) and not math.isnan(metrics.get("wvht_avg_6h", np.nan)):
+        if metrics["wvht_avg_1h"] > metrics["wvht_avg_6h"] * 1.15:
+            notes.append("Wave height increasing vs 6-hr mean; short-period build-up likely.")
+        elif metrics["wvht_avg_1h"] < metrics["wvht_avg_6h"] * 0.85:
+            notes.append("Wave height decreasing vs 6-hr mean; easing sea state.")
+        else:
+            notes.append("Wave height roughly steady over the last 6 hours.")
+
+    if not math.isnan(metrics.get("pres_delta_6h", np.nan)):
+        if metrics["pres_delta_6h"] <= -2.0:
+            notes.append("Falling pressure over 6 h suggests an approaching low.")
+        elif metrics["pres_delta_6h"] >= 2.0:
+            notes.append("Rising pressure over 6 h suggests improving conditions.")
+
+    if not math.isnan(metrics.get("wspd_wvht_corr_6h", np.nan)):
+        if metrics["wspd_wvht_corr_6h"] >= 0.5:
+            notes.append("Wind speed and wave height are strongly coupled (r ≥ 0.5).")
+        elif metrics["wspd_wvht_corr_6h"] <= 0.1:
+            notes.append("Weak wind–wave coupling; swell or mixed sea likely.")
+
+    if metrics.get("anomaly_flag"):
+        notes.append("Rapid change (>20%) detected within last hour—monitor for short-term hazards.")
+
+    if not math.isnan(metrics.get("tide_range_6h", np.nan)):
+        notes.append(f"6-hr tide range ~{metrics['tide_range_6h']:.2f} m at Sandy Hook.")
+
+    return " ".join(notes) if notes else "Conditions within expected variability."
+
+
+def compute_metrics(df_met: pd.DataFrame, df_tide: pd.DataFrame, now_utc: datetime) -> dict:
+    one_hr = now_utc - timedelta(hours=1)
+    six_hr = now_utc - timedelta(hours=6)
+
+    met_6h = df_met[df_met.index >= six_hr]
+    met_1h = df_met[df_met.index >= one_hr]
+    tide_6h = df_tide[df_tide.index >= six_hr] if not df_tide.empty else pd.DataFrame()
+
+    wvht_avg_1h = float(met_1h["WVHT"].mean()) if "WVHT" in met_1h and not met_1h["WVHT"].dropna().empty else float("nan")
+    wvht_max_1h = float(met_1h["WVHT"].max()) if "WVHT" in met_1h and not met_1h["WVHT"].dropna().empty else float("nan")
+
+    wvht_avg_6h = float(met_6h["WVHT"].mean()) if "WVHT" in met_6h and not met_6h["WVHT"].dropna().empty else float("nan")
+    wvht_max_6h = float(met_6h["WVHT"].max()) if "WVHT" in met_6h and not met_6h["WVHT"].dropna().empty else float("nan")
+
+    dpd_dom_6h = float(met_6h["DPD"].median()) if "DPD" in met_6h and not met_6h["DPD"].dropna().empty else float("nan")
+    mwd_mean_6h = float(dominant_mode(met_6h["MWD"])) if "MWD" in met_6h else float("nan")
+
+    wspd = met_6h["WSPD"] if "WSPD" in met_6h else pd.Series(dtype=float)
+    wvht = met_6h["WVHT"] if "WVHT" in met_6h else pd.Series(dtype=float)
+    wspd_wvht_corr_6h = float(wspd.corr(wvht)) if len(wspd.dropna()) >= 3 and len(wvht.dropna()) >= 3 else float("nan")
+
+    anomaly_params = {}
+    for name, ser in {
+        "WVHT": met_1h.get("WVHT"),
+        "WSPD": met_1h.get("WSPD"),
+        "PRES": met_1h.get("PRES"),
+    }.items():
+        if ser is None:
+            anomaly_params[name] = np.nan
+        else:
+            anomaly_params[name] = pct_change_over_window(ser)
+
+    tide_var_1h = np.nan
+    if not tide_6h.empty:
+        tide_recent = tide_6h[tide_6h.index >= one_hr]["tide_m"]
+        tide_var_1h = pct_change_over_window(tide_recent)
+
+    anomaly_flag = any((not math.isnan(v) and v > 20.0) for v in [*anomaly_params.values(), tide_var_1h])
+
+    pres_delta_6h = float("nan")
+    if "PRES" in met_6h and len(met_6h["PRES"].dropna()) >= 2:
+        pres_delta_6h = float(met_6h["PRES"].iloc[-1] - met_6h["PRES"].iloc[0])
+
+    tide_range_6h = float("nan")
+    if not tide_6h.empty:
+        tide_range_6h = float(tide_6h["tide_m"].max() - tide_6h["tide_m"].min())
+
+    metrics = {
+        "wvht_avg_1h": wvht_avg_1h,
+        "wvht_max_1h": wvht_max_1h,
+        "wvht_avg_6h": wvht_avg_6h,
+        "wvht_max_6h": wvht_max_6h,
+        "dpd_dom_6h": dpd_dom_6h,
+        "mwd_mean_6h": mwd_mean_6h,
+        "wspd_wvht_corr_6h": wspd_wvht_corr_6h,
+        "anomaly_flag": anomaly_flag,
+        "anomaly_pct_WVHT_1h": anomaly_params.get("WVHT", np.nan),
+        "anomaly_pct_WSPD_1h": anomaly_params.get("WSPD", np.nan),
+        "anomaly_pct_PRES_1h": anomaly_params.get("PRES", np.nan),
+        "anomaly_pct_TIDE_1h": tide_var_1h,
+        "pres_delta_6h": pres_delta_6h,
+        "tide_range_6h": tide_range_6h,
+    }
+    return metrics
+
+
+def plot_wave_trend(met_6h: pd.DataFrame, now_utc: datetime, out_path: str):
+    plt.figure(figsize=(8, 4.5))
+    sub = met_6h["WVHT"].dropna() if "WVHT" in met_6h else pd.Series(dtype=float)
+    if not sub.empty:
+        sub.plot()
+    plt.title(f"NDBC {STATION_NDBC} Wave Height (last 6 hours, WVHT, m) – {now_utc:%Y-%m-%d %H:%M}Z")
+    plt.xlabel("Time (UTC)")
+    plt.ylabel("Significant Wave Height (m)")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_path)
+    plt.close()
+
+
+def write_outputs(now_utc: datetime, df_met: pd.DataFrame, df_tide: pd.DataFrame, metrics: dict):
+    metrics_row = {"timestamp_utc": now_utc.isoformat(), **metrics}
+    df_metrics = pd.DataFrame([metrics_row])
+
+    csv_path = os.path.join(OUT_DIR, "metrics_log.csv")
+    if os.path.exists(csv_path):
+        df_metrics.to_csv(csv_path, mode="a", header=False, index=False)
+    else:
+        df_metrics.to_csv(csv_path, index=False)
+
+    interpretation = build_interpretation(metrics)
+
+    core_lines = [
+        f"Avg WVHT 1h:   {metrics['wvht_avg_1h']:.2f} m   | Max WVHT 1h: {metrics['wvht_max_1h']:.2f} m",
+        f"Avg WVHT 6h:   {metrics['wvht_avg_6h']:.2f} m   | Max WVHT 6h: {metrics['wvht_max_6h']:.2f} m",
+        f"Dom Period:    {metrics['dpd_dom_6h']:.1f} s   | Mean Dir: {metrics['mwd_mean_6h']:.0f}° (true)",
+        f"Wind–Wave r:   {metrics['wspd_wvht_corr_6h']:.2f}",
+        f"ΔPressure 6h:  {metrics['pres_delta_6h']:.1f} hPa",
+        f"Tide range 6h: {metrics['tide_range_6h']:.2f} m",
+        f"Anomaly >20%?  {'YES' if metrics['anomaly_flag'] else 'no'}"
+    ]
+
+    report = [
+        "============================================================",
+        f"Sandy Hook Live Ocean Summary  (NDBC {STATION_NDBC}  |  CO-OPS {STATION_COOPS})",
+        f"Retrieval UTC: {now_utc:%Y-%m-%d %H:%M:%S}Z",
+        "============================================================",
+        *core_lines,
+        "----",
+        f"Interpretation: {interpretation}",
+        ""
+    ]
+    report_text = "\n".join(report)
+    print(report_text)
+
+    run_id = now_utc.strftime("%Y%m%dT%H%M%SZ")
+    txt_path = os.path.join(OUT_DIR, f"summary_{run_id}.txt")
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(report_text + "\n")
+
+    six_hr = now_utc - timedelta(hours=6)
+    met_6h = df_met[df_met.index >= six_hr]
+    plot_path = os.path.join(OUT_DIR, "wave_trend.png")
+    try:
+        plot_wave_trend(met_6h, now_utc, plot_path)
+    except Exception:
+        traceback.print_exc()
+        print("Plotting failed; continuing.")
+
+
+def single_cycle():
+    now_utc = datetime.now(TIMEZONE)
+
+    # Fetch data
+    try:
+        df_met = fetch_ndbc_df()
+    except Exception as e:
+        print(f"[{now_utc.isoformat()}] NDBC fetch/parse error: {e}")
+        traceback.print_exc()
+        # create empty df with datetime index so later code doesn't break
+        df_met = pd.DataFrame(columns=["WVHT", "WSPD", "PRES"]).set_index(pd.DatetimeIndex([]))
+
+    try:
+        df_tide = fetch_coops_tide_df()
+    except Exception as e:
+        print(f"[{now_utc.isoformat()}] Tide fetch error: {e}")
+        traceback.print_exc()
+        df_tide = pd.DataFrame(columns=["tide_m"]).set_index(pd.DatetimeIndex([]))
+
+    # Ensure required columns exist
+    for needed in ["WVHT", "DPD", "MWD", "WSPD", "GST", "PRES"]:
+        if needed not in df_met.columns:
+            df_met[needed] = np.nan
+
+    metrics = compute_metrics(df_met, df_tide, now_utc)
+    write_outputs(now_utc, df_met, df_tide, metrics)
+
+
+def main_loop():
+    print("Starting Sandy Hook monitor. Output dir:", OUT_DIR)
+    while True:
+        try:
+            single_cycle()
+        except requests.exceptions.RequestException as e:
+            print(f"[{datetime.now(TIMEZONE).isoformat()}] Network error: {e}. Will retry.")
+        except Exception as e:
+            print(f"[{datetime.now(TIMEZONE).isoformat()}] Unexpected error: {e}")
+            traceback.print_exc()
+
+        # Interruptible sleep (Ctrl+C responsiveness)
+        try:
+            for _ in range(POLL_SECONDS):
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("KeyboardInterrupt received — exiting.")
+            break
+
+
+if __name__ == "__main__":
+    main_loop()
+
